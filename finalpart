@@ -1,0 +1,202 @@
+import json
+import asyncio
+import base64
+import requests
+import socket
+from playwright.async_api import async_playwright
+import nest_asyncio
+from textwrap import TextWrapper
+
+# Apply the nest_asyncio patch
+nest_asyncio.apply()
+
+# API keys
+SECURITYTRAILS_API_KEY = "6-uI117xpuESjfCLWXjFRxB36LJj0TQu"
+TOGETHER_AI_API_KEY = "65e1878d0ef9a76318673e436064e019da8b3e00fc25849510afa34a6a2a9eaa"
+
+def get_subdomains_securitytrails(domain):
+    try:
+        url = f"https://api.securitytrails.com/v1/domain/{domain}/subdomains"
+        headers = {"APIKEY": SECURITYTRAILS_API_KEY}
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return [f"{sub}.{domain}" for sub in data.get("subdomains", [])]
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] SecurityTrails API failed: {e}")
+        return []
+
+def resolve_ip(subdomain):
+    try:
+        return socket.gethostbyname(subdomain)
+    except socket.gaierror:
+        return "N/A"
+
+def detect_cdn_and_firewall(subdomain):
+    try:
+        response = requests.get(f"http://{subdomain}", timeout=5)
+        headers = response.headers
+        cdn, firewall = "N/A", "N/A"
+
+        # CDN detection
+        if 'cloudflare' in headers.get('server', '').lower():
+            cdn = "Cloudflare"
+        elif 'akamai' in headers.get('server', '').lower():
+            cdn = "Akamai"
+        elif 'fastly' in headers.get('server', '').lower():
+            cdn = "Fastly"
+        elif 'cloudfront' in headers.get('via', '').lower():
+            cdn = "Amazon CloudFront"
+
+        # Firewall detection
+        if 'x-sucuri-id' in headers:
+            firewall = "Sucuri"
+        elif 'cf-ray' in headers:
+            firewall = "Cloudflare WAF"
+        elif 'x-waf' in headers:
+            firewall = "Generic WAF"
+
+        return cdn, firewall
+    except requests.exceptions.RequestException:
+        return "N/A", "N/A"
+
+def encode_image(image_path):
+    try:
+        with open(image_path, "rb") as img:
+            return base64.b64encode(img.read()).decode()
+    except FileNotFoundError:
+        print(f"[ERROR] File not found: {image_path}")
+        return None
+
+def llama32(messages):
+    url = "https://api.together.xyz/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {TOGETHER_AI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo",
+        "messages": messages
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"[ERROR] LLaMA API error: {e}")
+        return "Error analyzing screenshot"
+
+async def setup_browser_context(playwright):
+    return await playwright.chromium.launch_persistent_context(
+        user_data_dir="user_data",
+        headless=True,
+        ignore_https_errors=True,
+        args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+    )
+
+async def capture_screenshot(context, subdomain):
+    page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        await page.goto(f"https://{subdomain}", timeout=60000, wait_until="domcontentloaded")
+        screenshot_path = f"{subdomain}.png"
+        await page.screenshot(path=screenshot_path, full_page=True)
+        return screenshot_path
+    except Exception as e:
+        print(f"[ERROR] Screenshot failed for {subdomain}: {e}")
+        return None
+
+async def analyze_screenshot(screenshot_path):
+    if not screenshot_path:
+        return "Failed to capture screenshot"
+
+    encoded_image = encode_image(screenshot_path)
+    if not encoded_image:
+        return "Failed to encode screenshot"
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Provide a concise description of this website's purpose or theme in 1 line."},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded_image}"}}
+            ]
+        }
+    ]
+    return llama32(messages)
+
+class TableFormatter:
+    def __init__(self):
+        self.col_widths = {
+            'number': 4,  # New column for numbering
+            'subdomain': 25,
+            'ip': 15,
+            'cdn': 12,
+            'firewall': 15,
+            'description': 60
+        }
+        self.wrapper = TextWrapper(width=self.col_widths['description'])
+    
+    def format_row(self, number, subdomain, ip, cdn, firewall, description):
+        # Format each column with fixed width
+        formatted_number = f"{number:<{self.col_widths['number']}}"
+        formatted_subdomain = f"{subdomain[:self.col_widths['subdomain']]:<{self.col_widths['subdomain']}}"
+        formatted_ip = f"{ip[:self.col_widths['ip']]:<{self.col_widths['ip']}}"
+        formatted_cdn = f"{cdn[:self.col_widths['cdn']]:<{self.col_widths['cdn']}}"
+        formatted_firewall = f"{firewall[:self.col_widths['firewall']]:<{self.col_widths['firewall']}}"
+        
+        # Wrap description text
+        wrapped_lines = self.wrapper.wrap(description)
+        if not wrapped_lines:
+            wrapped_lines = ['N/A']
+        
+        # First line with all columns
+        first_line = f"{formatted_number}{formatted_subdomain}{formatted_ip}{formatted_cdn}{formatted_firewall}{wrapped_lines[0]}"
+        
+        # Additional lines if description wraps
+        continuation_lines = []
+        if len(wrapped_lines) > 1:
+            padding = ' ' * (self.col_widths['number'] + self.col_widths['subdomain'] + 
+                             self.col_widths['ip'] + self.col_widths['cdn'] + 
+                             self.col_widths['firewall'])
+            for line in wrapped_lines[1:]:
+                continuation_lines.append(f"{padding}{line}")
+        
+        return [first_line] + continuation_lines
+
+async def process_subdomain(context, number, subdomain, formatter):
+    ip_address = resolve_ip(subdomain)
+    cdn, firewall = detect_cdn_and_firewall(subdomain)
+    screenshot_path = await capture_screenshot(context, subdomain)
+    description = await analyze_screenshot(screenshot_path)
+    
+    # Format and print the row(s)
+    rows = formatter.format_row(f"{number}.", subdomain, ip_address, cdn, firewall, description)
+    for row in rows:
+        print(row)
+
+async def main(domain):
+    subdomains = get_subdomains_securitytrails(domain)
+    formatter = TableFormatter()
+    
+    async with async_playwright() as playwright:
+        context = await setup_browser_context(playwright)
+        
+        # Print header
+        header = formatter.format_row("#", "Subdomain", "IP Address", "CDN", "Firewall", "Description")[0]
+        print(header)
+        print("-" * len(header))
+        
+        for number, subdomain in enumerate(subdomains, 1):
+            await process_subdomain(context, number, subdomain, formatter)
+        
+        await context.close()
+
+def run_async_in_jupyter(coro):
+    loop = asyncio.get_event_loop()
+    return asyncio.create_task(coro) if loop.is_running() else asyncio.run(coro)
+
+if __name__ == "__main__":
+    domain = input("Enter the domain to analyze: ")
+    run_async_in_jupyter(main(domain))
